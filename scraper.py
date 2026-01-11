@@ -4,7 +4,6 @@
 # In[2]:
 
 
-pip install requests beautifulsoup4
 
 
 # In[6]:
