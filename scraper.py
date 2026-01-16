@@ -12,7 +12,6 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
 BASE_URL = "https://consensus.hankyung.com"
-# 페이지 번호를 바꿀 수 있는 URL 구조
 LIST_URL = "https://consensus.hankyung.com/analysis/list?page={}"
 SENT_REPORTS_FILE = "sent_reports.txt"
 
@@ -42,41 +41,44 @@ async def send_telegram_message(message):
 
 async def main():
     now_kst = datetime.utcnow() + timedelta(hours=9)
-    # 스크린샷 확인 결과: 날짜 형식이 YYYY-MM-DD (하이픈)임
+    # 날짜 형식을 '2026-01-16'으로 설정
     today_str = now_kst.strftime("%Y-%m-%d")
     
     if now_kst.hour >= 17:
-        print("오후 5시 종료.")
+        print("오후 5시 이후 종료.")
         return
 
     sent_ids = get_sent_ids()
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     new_reports_count = 0
 
-    # 1페이지부터 3페이지까지 탐색
     for page in range(1, 4):
-        print(f"--- {page}페이지 탐색 중 ---")
+        print(f"--- {page}페이지 탐색 시작 ---")
         try:
-            response = requests.get(LIST_URL.format(page), headers=headers, timeout=15)
+            # 주소 뒤에 파라미터를 붙여 페이지 이동
+            response = requests.get(LIST_URL.format(page), headers=headers, timeout=20)
             soup = BeautifulSoup(response.text, 'html.parser')
-            rows = soup.select('div.table_style01 table tbody tr')
             
-            if not rows: break
-
+            # 테이블의 모든 행(tr)을 가져옴
+            rows = soup.find_all('tr')
+            
             for row in rows:
                 cols = row.find_all('td')
                 if len(cols) < 5: continue
                 
-                report_date = cols[0].get_text(strip=True)
-                category = cols[1].get_text(strip=True)
+                # 공백을 완전히 제거한 텍스트 추출
+                raw_date = cols[0].get_text(strip=True)
+                raw_category = cols[1].get_text(strip=True)
                 
-                # 오늘 날짜이고 분류에 '산업'이 포함된 경우
-                if report_date == today_str and "산업" in category:
+                # 날짜가 오늘 날짜를 '포함'하고, 분류에 '산업'이 '포함'되어 있는지 검사 (가장 확실한 방법)
+                if today_str in raw_date and "산업" in raw_category:
                     title_tag = cols[2].find('a')
                     if not title_tag: continue
                     
                     title = title_tag.get_text(strip=True)
                     link = title_tag['href']
+                    
+                    # 리포트 고유 번호 추출
                     match = re.search(r'report_idx=(\d+)', link)
                     report_id = match.group(1) if match else title
                     
@@ -93,14 +95,14 @@ async def main():
                         save_sent_id(report_id)
                         sent_ids.add(report_id)
                         new_reports_count += 1
-            
-            # 서버 부하 방지를 위해 페이지 간 짧은 휴식
-            time.sleep(1)
+                        print(f"발견 및 전송: {title}")
+
+            time.sleep(1) # 차단 방지용
             
         except Exception as e:
-            print(f"{page}페이지 오류: {e}")
+            print(f"{page}페이지 탐색 중 에러: {e}")
 
-    print(f"[{now_kst.strftime('%H:%M')}] 총 {new_reports_count}건 전송 완료.")
+    print(f"[{now_kst.strftime('%H:%M')}] 탐색 종료. 오늘 자 새 리포트 {new_reports_count}건 처리됨.")
 
 if __name__ == "__main__":
     asyncio.run(main())
