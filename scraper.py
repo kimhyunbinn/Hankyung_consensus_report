@@ -33,9 +33,9 @@ async def main():
     now_kst = datetime.utcnow() + timedelta(hours=9)
     today_str = now_kst.strftime("%Y.%m.%d")
     
-    # 12시 이후 실행 방지 (안전을 위한 2중 장치)
-    if now_kst.hour >= 12:
-        print("오후 12시 이후이므로 종료합니다.")
+    # 17시 이후 실행 방지 (안전을 위한 2중 장치)
+    if now_kst.hour >= 17:
+        print("오후 5시 이후이므로 종료합니다.")
         return
 
     sent_ids = get_sent_ids()
