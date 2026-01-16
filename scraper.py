@@ -1,40 +1,99 @@
-import requests
-from bs4 import BeautifulSoup
-import datetime
 import os
+import requests
+import telegram
+import asyncio
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
 
-# 텔레그램 설정 (실제 사용 시 환경변수로 관리하는 것이 보안상 좋습니다)
-# 로컬에서 테스트할 때는 직접 입력하세요.
-TELEGRAM_TOKEN = '8534796698:AAEwrXgBe3RbLRgalMGllE2jsUsgL0y2K_E'
-CHAT_ID = '1594303792'
+# --- 환경 변수 ---
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+CHAT_ID = os.environ.get('CHAT_ID')
 
-def send_telegram_message(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
-    requests.post(url, json=payload)
+URL = "https://consensus.hankyung.com/analysis/list"
+BASE_URL = "https://consensus.hankyung.com"
+SENT_REPORTS_FILE = "sent_reports.txt" # 보낸 리포트 ID 저장 파일
 
-def scrape_hankyung_consensus():
-    # 한경 컨센서스 메인 페이지 (전체 리포트 목록)
-    url = "https://markets.hankyung.com/consensus"
+# 1. 이미 보낸 리포트 ID 목록 가져오기
+def get_sent_ids():
+    if not os.path.exists(SENT_REPORTS_FILE):
+        return set()
+    with open(SENT_REPORTS_FILE, "r") as f:
+        return set(line.strip() for line in f.readlines())
+
+# 2. 새로 보낸 리포트 ID 저장하기
+def save_sent_id(report_id):
+    with open(SENT_REPORTS_FILE, "a") as f:
+        f.write(f"{report_id}\n")
+
+async def send_telegram_message(message):
+    bot = telegram.Bot(token=TELEGRAM_TOKEN)
+    await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML', disable_web_page_preview=True)
+
+async def main():
+    now_kst = datetime.utcnow() + timedelta(hours=9)
+    today_str = now_kst.strftime("%Y.%m.%d")
     
-    response = requests.get(url)
-    soup = BeautifulSoup(response.text, 'html.parser')
-    
-    # 오늘 날짜 구하기 (YYYY-MM-DD 포맷)
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    
-    # 리포트 리스트 테이블의 행(row)들을 가져옵니다.
-    # 사이트 구조에 따라 클래스명이 다를 수 있으나, 일반적으로 table body 안의 tr을 찾습니다.
-    rows = soup.select("div.table_style01 table tbody tr")
-    
-    report_count = 0
-    message_buffer = f"📊 <b>오늘({today})의 산업 리포트</b>\n\n"
-    
+    # 12시 이후 실행 방지 (안전을 위한 2중 장치)
+    if now_kst.hour >= 12:
+        print("오후 12시 이후이므로 종료합니다.")
+        return
+
+    sent_ids = get_sent_ids()
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+    try:
+        response = requests.get(URL, headers=headers, timeout=15)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        rows = soup.select('div.table_style01 table tbody tr')
+        
+        new_reports_found = 0
+
+        for row in rows:
+            cols = row.find_all('td')
+            if len(cols) < 5: continue
+            
+            report_date = cols[0].text.strip()
+            category = cols[1].text.strip()
+            
+            # 오늘 날짜 + '산업' 카테고리
+            if report_date == today_str and category == "산업":
+                title_tag = cols[2].find('a')
+                if not title_tag: continue
+                
+                title = title_tag.text.strip()
+                link = title_tag['href']
+                
+                # 고유 ID 추출 (예: report_idx=645432)
+                import re
+                match = re.search(r'report_idx=(\d+)', link)
+                report_id = match.group(1) if match else title
+                
+                # 3. 중복 확인: 이미 보낸 ID가 아니면 전송
+                if report_id not in sent_ids:
+                    full_link = BASE_URL + link if link.startswith('/') else link
+                    securities = cols[5].text.strip()
+                    
+                    msg = (f"<b>🔔 새로운 산업 리포트 발견!</b>\n\n"
+                           f"기관: <b>{securities}</b>\n"
+                           f"제목: {title}\n"
+                           f"<a href='{full_link}'>👉 원문 보기</a>")
+                    
+                    await send_telegram_message(msg)
+                    save_sent_id(report_id) # 보낸 목록에 추가
+                    sent_ids.add(report_id)
+                    new_reports_found += 1
+                    print(f"새 리포트 전송: {title}")
+
+        if new_reports_found == 0:
+            print(f"[{now_kst.strftime('%H:%M')}] 새로운 리포트가 없습니다.")
+        else:
+            print(f"총 {new_reports_found}개의 새 리포트를 보냈습니다.")
+
+    except Exception as e:
+        print(f"에러 발생: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())    
     for row in rows:
         try:
             # 각 행의 데이터 추출
