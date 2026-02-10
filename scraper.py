@@ -4,15 +4,22 @@ import telegram
 import asyncio
 import re
 import time
+import fitz  # PyMuPDF
+import google.generativeai as genai
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+from io import BytesIO
 
-# --- 환경 변수 설정 ---
+# --- 환경 변수 가져오기 ---
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+
+# Gemini 설정
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 BASE_URL = "https://consensus.hankyung.com"
-# 산업 섹션 직접 타겟팅
 TARGET_URL = "https://consensus.hankyung.com/analysis/list?skinType=industry&now_page={}"
 SENT_REPORTS_FILE = "sent_reports.txt"
 
@@ -29,76 +36,82 @@ def save_sent_id(report_id):
             f.write(f"{report_id}\n")
     except: pass
 
-async def send_telegram_message(message):
-    if not TELEGRAM_TOKEN or not CHAT_ID: return
+# --- 요약 함수 ---
+async def get_summary(pdf_url):
     try:
-        bot = telegram.Bot(token=TELEGRAM_TOKEN)
-        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML', disable_web_page_preview=True)
-    except Exception as e:
-        print(f"전송 오류: {e}")
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(pdf_url, headers=headers, timeout=20)
+        # PDF 앞 3페이지만 읽기 (속도/비용 최적화)
+        with fitz.open(stream=BytesIO(response.content), filetype="pdf") as doc:
+            text = "".join([page.get_text() for page in doc[:3]])
+        
+        if not text.strip(): return "내용 요약 불가 (이미지 위주 리포트)"
+        
+        prompt = f"금융 분석가로서 다음 리포트를 핵심만 3줄 요약해줘:\n{text[:7000]}"
+        # 동기 함수인 generate_content를 비동기처럼 실행
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(None, lambda: model.generate_content(prompt))
+        return res.text
+    except:
+        return "요약 생성 중 오류가 발생했습니다. 원문을 참고하세요."
 
 async def main():
     now_kst = datetime.utcnow() + timedelta(hours=9)
     today_str = now_kst.strftime("%Y-%m-%d")
     
-    if now_kst.hour >= 18: 
-        print("업무 시간 종료")
-        return
-
     sent_ids = get_sent_ids()
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
+    bot = telegram.Bot(token=TELEGRAM_TOKEN)
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
-    new_count = 0
-    # 1~3페이지 탐색
-    for page in range(1, 4):
-        try:
-            url = TARGET_URL.format(page)
-            res = requests.get(url, headers=headers, timeout=20)
-            soup = BeautifulSoup(res.text, 'html.parser')
+    for page in range(1, 3):
+        url = TARGET_URL.format(page)
+        res = requests.get(url, headers=headers, timeout=15)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        rows = soup.find_all('tr')
+        
+        for row in rows:
+            cols = row.find_all('td')
+            if len(cols) < 5: continue
             
-            # 모든 행을 가져옴
-            rows = soup.find_all('tr')
-            
-            for row in rows:
-                cols = row.find_all('td')
-                if len(cols) < 5: continue
+            if today_str in row.get_text():
+                a_tag = row.find('a', href=re.compile(r'report_idx='))
+                if not a_tag: continue
                 
-                # 데이터 추출
-                row_text = row.get_text("|", strip=True)
-                # 조건: 오늘 날짜가 포함되어 있는가? (산업 섹션이므로 날짜만 확인해도 됨)
-                if today_str in row_text:
-                    a_tag = row.find('a', href=re.compile(r'report_idx='))
-                    if not a_tag: continue
-                    
+                link = a_tag['href']
+                report_id = re.search(r'report_idx=(\d+)', link).group(1)
+                
+                if report_id not in sent_ids:
                     title = a_tag.get_text(strip=True)
-                    link = a_tag['href']
+                    provider = cols[4].get_text(strip=True)
+                    full_link = BASE_URL + link if link.startswith('/') else link
                     
-                    # 고유 ID (중복 방지용)
-                    report_id = re.search(r'report_idx=(\d+)', link).group(1)
+                    # 1. 즉시 알림 전송 (지연 최소화)
+                    base_msg = (f"<b>🏗️ 새로운 산업 리포트!</b>\n\n"
+                                f"출처: <b>{provider}</b>\n"
+                                f"제목: {title}\n"
+                                f"⏳ <i>요약 분석 중... 잠시만 기다려주세요.</i>\n\n"
+                                f"<a href='{full_link}'>👉 원문 보기</a>")
                     
-                    if report_id not in sent_ids:
-                        full_link = BASE_URL + link if link.startswith('/') else link
-                        # 제공처는 보통 5번째 td
-                        provider = cols[4].get_text(strip=True)
-                        
-                        msg = (f"<b>🏗️ 새로운 산업 리포트!</b>\n\n"
-                               f"출처: <b>{provider}</b>\n"
-                               f"제목: {title}\n"
-                               f"<a href='{full_link}'>👉 리포트 보기(PDF)</a>")
-                        
-                        await send_telegram_message(msg)
-                        save_sent_id(report_id)
-                        sent_ids.add(report_id)
-                        new_count += 1
-                        print(f"전송 성공: {title}")
-            
-            time.sleep(1)
-        except Exception as e:
-            print(f"{page}페이지 오류: {e}")
+                    sent_msg = await bot.send_message(chat_id=CHAT_ID, text=base_msg, parse_mode='HTML', disable_web_page_preview=True)
+                    save_sent_id(report_id)
+                    sent_ids.add(report_id)
 
-    print(f"탐색 완료: 오늘 자 {new_count}건 처리")
+                    # 2. 백그라운드에서 요약 후 기존 메시지 수정
+                    summary = await get_summary(full_link)
+                    updated_msg = (f"<b>🏗️ 산업 리포트 요약</b>\n\n"
+                                   f"출처: <b>{provider}</b>\n"
+                                   f"제목: {title}\n"
+                                   f"--------------------------\n"
+                                   f"{summary}\n"
+                                   f"--------------------------\n"
+                                   f"<a href='{full_link}'>👉 원문 보기</a>")
+                    
+                    try:
+                        await bot.edit_message_text(chat_id=CHAT_ID, message_id=sent_msg.message_id, text=updated_msg, parse_mode='HTML', disable_web_page_preview=True)
+                    except:
+                        pass 
+                    
+                    await asyncio.sleep(1) # API 부하 방지
 
 if __name__ == "__main__":
     asyncio.run(main())
