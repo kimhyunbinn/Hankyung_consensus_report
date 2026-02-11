@@ -16,8 +16,21 @@ CHAT_ID = os.environ.get('CHAT_ID')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
 BASE_URL = "https://consensus.hankyung.com"
-TARGET_URL = "https://consensus.hankyung.com/analysis/list?skinType=industry&now_page={}"
 SENT_REPORTS_FILE = "sent_reports.txt"
+
+# 감시할 대상 목록 (산업 + 시장)
+TARGETS = [
+    {
+        "name": "산업",
+        "icon": "🏗️",
+        "url_pattern": "https://consensus.hankyung.com/analysis/list?skinType=industry&now_page={}"
+    },
+    {
+        "name": "시장",
+        "icon": "📈",
+        "url_pattern": "https://consensus.hankyung.com/analysis/list?skinType=market&now_page={}"
+    }
+]
 
 def get_sent_ids():
     if not os.path.exists(SENT_REPORTS_FILE): return set()
@@ -30,7 +43,7 @@ def save_sent_id(report_id):
     with open(SENT_REPORTS_FILE, "a", encoding="utf-8") as f:
         f.write(f"{report_id}\n")
 
-# --- 핵심 변경: 라이브러리 없이 직접 요청 ---
+# --- Gemini REST API 요약 ---
 def get_summary_rest(text):
     if not GEMINI_API_KEY:
         return "API 키가 설정되지 않았습니다."
@@ -46,18 +59,12 @@ def get_summary_rest(text):
     {text[:8000]}
     """
     
-    data = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }]
-    }
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
     
     try:
         response = requests.post(url, headers=headers, data=json.dumps(data), timeout=30)
         if response.status_code == 200:
-            result = response.json()
-            # 응답 구조 파싱
-            return result['candidates'][0]['content']['parts'][0]['text'].strip()
+            return response.json()['candidates'][0]['content']['parts'][0]['text'].strip()
         else:
             return f"API 호출 오류 (Code: {response.status_code})"
     except Exception as e:
@@ -93,57 +100,72 @@ async def main():
     headers = {'User-Agent': 'Mozilla/5.0'}
 
     new_count = 0
-    for page in range(1, 3):
-        try:
-            url = TARGET_URL.format(page)
-            res = requests.get(url, headers=headers, timeout=15)
-            soup = BeautifulSoup(res.text, 'html.parser')
-            rows = soup.find_all('tr')
-            
-            for row in rows:
-                cols = row.find_all('td')
-                if len(cols) < 5: continue
+    
+    # 산업과 시장 리포트를 각각 순회
+    for target in TARGETS:
+        category_name = target['name']
+        category_icon = target['icon']
+        base_url = target['url_pattern']
+        
+        print(f"--- {category_name} 리포트 탐색 시작 ---")
+        
+        for page in range(1, 3): # 각 카테고리별 1~2페이지 탐색
+            try:
+                url = base_url.format(page)
+                res = requests.get(url, headers=headers, timeout=15)
+                soup = BeautifulSoup(res.text, 'html.parser')
+                rows = soup.find_all('tr')
                 
-                row_text = row.get_text(strip=True)
-                if any(date_str in row_text for date_str in date_formats):
-                    a_tag = row.find('a', href=re.compile(r'report_idx='))
-                    if not a_tag: continue
+                for row in rows:
+                    cols = row.find_all('td')
+                    if len(cols) < 5: continue
                     
-                    link = a_tag['href']
-                    report_id = re.search(r'report_idx=(\d+)', link).group(1)
-                    
-                    if report_id not in sent_ids:
-                        title = a_tag.get_text(strip=True)
-                        provider = cols[4].get_text(strip=True)
-                        full_link = BASE_URL + link if link.startswith('/') else link
+                    row_text = row.get_text(strip=True)
+                    # 오늘 날짜와 일치하는지 확인
+                    if any(date_str in row_text for date_str in date_formats):
+                        a_tag = row.find('a', href=re.compile(r'report_idx='))
+                        if not a_tag: continue
                         
-                        print(f"요약 시도: {title}")
+                        link = a_tag['href']
+                        report_id = re.search(r'report_idx=(\d+)', link).group(1)
                         
-                        # PDF 텍스트 추출
-                        pdf_text = get_pdf_text(full_link)
-                        
-                        if len(pdf_text) > 50:
-                            summary = get_summary_rest(pdf_text)
-                        else:
-                            summary = "요약 실패 (텍스트 추출 불가 - 이미지 리포트 가능성)"
+                        if report_id not in sent_ids:
+                            title = a_tag.get_text(strip=True)
+                            provider = cols[4].get_text(strip=True)
+                            full_link = BASE_URL + link if link.startswith('/') else link
+                            
+                            print(f"[{category_name}] 새 리포트 발견: {title}")
+                            
+                            # PDF 텍스트 추출 및 요약
+                            pdf_text = get_pdf_text(full_link)
+                            
+                            if len(pdf_text) > 50:
+                                summary = get_summary_rest(pdf_text)
+                            else:
+                                summary = "요약 실패 (텍스트 추출 불가 - 이미지 리포트 가능성)"
 
-                        msg = (f"<b>🏗️ 새로운 산업 리포트!</b>\n\n"
-                               f"출처: <b>{provider}</b>\n"
-                               f"제목: {title}\n"
-                               f"--------------------------\n"
-                               f"{summary}\n"
-                               f"--------------------------\n"
-                               f"<a href='{full_link}'>👉 리포트 원문(PDF) 보기</a>")
-                        
-                        await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML', disable_web_page_preview=True)
-                        save_sent_id(report_id)
-                        sent_ids.add(report_id)
-                        new_count += 1
-                        await asyncio.sleep(2)
-        except Exception as e:
-            print(f"페이지 처리 중 오류: {e}")
+                            # 메시지 전송 (카테고리별 아이콘 적용)
+                            msg = (f"<b>{category_icon} 새로운 {category_name} 리포트!</b>\n\n"
+                                   f"출처: <b>{provider}</b>\n"
+                                   f"제목: {title}\n"
+                                   f"--------------------------\n"
+                                   f"{summary}\n"
+                                   f"--------------------------\n"
+                                   f"<a href='{full_link}'>👉 리포트 원문(PDF) 보기</a>")
+                            
+                            await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML', disable_web_page_preview=True)
+                            save_sent_id(report_id)
+                            sent_ids.add(report_id)
+                            new_count += 1
+                            
+                            # API 제한 및 서버 부하 방지를 위한 대기
+                            await asyncio.sleep(2)
+            except Exception as e:
+                print(f"{category_name} {page}페이지 오류: {e}")
+            
+            time.sleep(1) # 페이지 넘길 때 대기
 
-    print(f"최종 처리 완료: {new_count}건")
+    print(f"탐색 완료: 총 {new_count}건 전송")
 
 if __name__ == "__main__":
     asyncio.run(main())
