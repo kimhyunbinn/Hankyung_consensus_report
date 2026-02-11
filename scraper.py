@@ -34,26 +34,44 @@ def save_sent_id(report_id):
 
 def get_summary(pdf_url):
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(pdf_url, headers=headers, timeout=25)
+        # 브라우저처럼 보이기 위해 헤더 강화
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://consensus.hankyung.com/'
+        }
+        response = requests.get(pdf_url, headers=headers, timeout=30)
+        response.raise_for_status() # HTTP 에러 발생 시 예외 처리
+        
         with fitz.open(stream=BytesIO(response.content), filetype="pdf") as doc:
-            text = "".join([page.get_text() for page in doc[:3]])
-        if not text.strip(): return "내용 요약 불가 (이미지 위주)"
-        prompt = f"금융 전문가로서 다음 리포트를 핵심만 3줄 요약해줘:\n{text[:7000]}"
-        res = model.generate_content(prompt)
-        return res.text.strip()
-    except:
-        return "요약 생성 실패 (원문 확인)"
+            text = ""
+            for page in doc[:3]:
+                text += page.get_text()
+        
+        if not text.strip() or len(text) < 50:
+            return "내용 요약 불가 (이미지 위주 리포트이거나 텍스트가 부족합니다.)"
+
+        prompt = f"당신은 금융 전문가입니다. 다음 리포트 내용을 바탕으로 핵심 투자 포인트 3가지를 불렛포인트로 요약해주세요. \n\n내용:\n{text[:7000]}"
+        
+        # Gemini 호출 (재시도 로직 포함)
+        for i in range(2):
+            try:
+                res = model.generate_content(prompt)
+                return res.text.strip()
+            except:
+                time.sleep(2)
+                continue
+        return "Gemini API 응답 오류"
+    except Exception as e:
+        print(f"요약 중 에러 발생: {str(e)}") # 로그에서 에러 확인용
+        return f"요약 실패 (원문 확인 요망)"
 
 async def main():
     now_kst = datetime.utcnow() + timedelta(hours=9)
-    # 한경컨센서스에서 사용하는 다양한 날짜 형식을 리스트로 만듭니다.
     date_formats = [
-        now_kst.strftime("%Y-%m-%d"), # 2026-02-11
-        now_kst.strftime("%y-%m-%d"), # 26-02-11
-        now_kst.strftime("%Y.%m.%d")  # 2026.02.11
+        now_kst.strftime("%Y-%m-%d"),
+        now_kst.strftime("%y-%m-%d"),
+        now_kst.strftime("%Y.%m.%d")
     ]
-    print(f"체크할 날짜 형식들: {date_formats}")
     
     sent_ids = get_sent_ids()
     bot = telegram.Bot(token=TELEGRAM_TOKEN)
@@ -71,7 +89,6 @@ async def main():
             if len(cols) < 5: continue
             
             row_text = row.get_text(strip=True)
-            # 설정한 날짜 형식 중 하나라도 행 안에 포함되어 있는지 확인
             if any(date_str in row_text for date_str in date_formats):
                 a_tag = row.find('a', href=re.compile(r'report_idx='))
                 if not a_tag: continue
@@ -84,7 +101,7 @@ async def main():
                     provider = cols[4].get_text(strip=True)
                     full_link = BASE_URL + link if link.startswith('/') else link
                     
-                    print(f"새 리포트 발견: {title} (ID: {report_id})")
+                    print(f"요약 시도 중: {title}")
                     summary = get_summary(full_link)
                     
                     msg = (f"<b>🏗️ 새로운 산업 리포트!</b>\n\n"
@@ -99,9 +116,9 @@ async def main():
                     save_sent_id(report_id)
                     sent_ids.add(report_id)
                     new_count += 1
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
 
-    print(f"최종 처리 완료: {new_count}건 전송")
+    print(f"최종 처리 완료: {new_count}건")
 
 if __name__ == "__main__":
     asyncio.run(main())
