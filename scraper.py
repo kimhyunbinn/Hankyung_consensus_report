@@ -17,23 +17,24 @@ BASE_URL = "https://consensus.hankyung.com"
 def get_summary_rest(text):
     if not GEMINI_API_KEY: return "❌ 키 미설정"
     
-    # [최종 수정] 404 방지를 위해 v1 정식 버전 엔드포인트 사용
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    # [핵심 변경] 모델명 뒤에 -latest를 붙여 최신 모델로 강제 지정
+    # 404 방지를 위해 가장 범용적인 v1beta 엔드포인트 사용
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
     
     headers = {'Content-Type': 'application/json'}
     payload = {
         "contents": [{
-            "parts": [{"text": f"다음 금융 리포트를 3가지 핵심 요점으로 요약해줘:\n\n{text[:7000]}"}]
+            "parts": [{"text": f"너는 금융 전문가야. 다음 리포트의 핵심 투자 포인트 3가지를 전문적인 한국어로 요약해줘:\n\n{text[:7000]}"}]
         }]
     }
     
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=20)
         
-        # 만약 v1에서 404가 나면 v1beta로 한 번 더 시도 (자동 전환)
+        # 만약 404가 뜨면 주소 체계를 v1으로 변경하여 재시도
         if res.status_code == 404:
-            url_beta = url.replace("/v1/", "/v1beta/")
-            res = requests.post(url_beta, headers=headers, json=payload, timeout=20)
+            url_v1 = url.replace("v1beta", "v1")
+            res = requests.post(url_v1, headers=headers, json=payload, timeout=20)
             
         if res.status_code == 200:
             return res.json()['candidates'][0]['content']['parts'][0]['text'].strip()
@@ -44,8 +45,7 @@ def get_summary_rest(text):
 
 def get_pdf_text(pdf_url):
     try:
-        # 리포트 원문 접속을 위한 헤더
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get(pdf_url, headers=headers, timeout=20)
         with fitz.open(stream=BytesIO(res.content), filetype="pdf") as doc:
             return "".join([p.get_text() for p in doc[:3]])
@@ -53,17 +53,20 @@ def get_pdf_text(pdf_url):
 
 async def main():
     bot = telegram.Bot(token=TELEGRAM_TOKEN)
-    # 산업(industry)과 시장(market) 모두 추적
-    targets = [{"n":"산업", "i":"🏗️", "t":"industry"}, {"n":"시장", "i":"📈", "t":"market"}]
+    # 산업(industry)과 시장(market) 카테고리 설정
+    targets = [
+        {"n":"산업", "i":"🏗️", "t":"industry"}, 
+        {"n":"시장", "i":"📈", "t":"market"}
+    ]
     
-    print("🚀 리포트 수집 및 요약 시작 (수동 실행)")
+    print("🚀 수동 모드: 산업/시장 최신 리포트 발송 시작")
     
     for cat in targets:
         url = f"https://consensus.hankyung.com/analysis/list?skinType={cat['t']}"
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 최신 2개씩만 테스트
+        # 최신 리포트 2개씩 선정
         rows = soup.select('tr')[1:3] 
         
         for row in rows:
@@ -75,7 +78,7 @@ async def main():
             
             title = a_tag.get_text(strip=True)
             
-            # 출처(증권사) 찾기: 숫자/날짜가 아닌 칸을 우선 선택
+            # 출처(증권사) 찾기: 숫자가 없는 문자열을 우선적으로 추출
             provider = "출처미상"
             for i in [4, 5, 3]:
                 val = cols[i].get_text(strip=True)
@@ -85,9 +88,9 @@ async def main():
             
             full_link = BASE_URL + a_tag['href'] if a_tag['href'].startswith('/') else a_tag['href']
             
-            # 요약 진행
+            # PDF 텍스트 추출 및 요약
             pdf_text = get_pdf_text(full_link)
-            summary = get_summary_rest(pdf_text) if len(pdf_text) > 100 else "❌ PDF 텍스트 추출 불가"
+            summary = get_summary_rest(pdf_text) if len(pdf_text) > 100 else "❌ PDF 내용 추출 실패"
             
             msg = (f"<b>{cat['i']} {cat['n']} 리포트</b>\n\n"
                    f"출처: <b>{provider}</b>\n"
