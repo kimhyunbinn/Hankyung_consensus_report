@@ -19,7 +19,7 @@ class DESAdapter(HTTPAdapter):
         kwargs['ssl_context'] = context
         return super(DESAdapter, self).init_poolmanager(*args, **kwargs)
 
-# --- 설정 ---
+# --- 설정 로드 ---
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
@@ -36,41 +36,43 @@ def add_to_sent_list(report_id):
     with open(DB_FILE, "a") as f: f.write(report_id + "\n")
 
 def get_summary_from_image(image_data):
-    """이미지(PDF 첫페이지)를 Gemini에게 직접 전달하여 요약"""
+    """이미지(PDF 첫페이지)를 Gemini 2.0 Flash에게 전달하여 시각 분석 요약"""
     if not GEMINI_API_KEY: return "❌ API 키 미설정"
     
-    # 2.0-flash 모델은 이미지 이해력이 매우 뛰어남
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    # 모델명은 최신 안정 버전을 사용
+    model_name = "gemini-1.5-flash" # 2.0-flash가 간혹 할당량 이슈가 있을 수 있어 1.5-flash로 우선 시도
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
     
     encoded_image = base64.b64encode(image_data).decode('utf-8')
     
     payload = {
         "contents": [{
             "parts": [
-                {"text": "너는 금융 전문가야. 첨부된 리포트 이미지를 분석해서 투자자가 알아야 할 핵심 내용만 5가지로 요약해줘.\n조건: 서론 없이 ✅ 기호 사용, 음슴체로 간결하게 작성."},
+                {"text": "너는 금융 전문가야. 첨부된 리포트 이미지를 읽고 투자자가 알아야 할 핵심 내용만 5가지로 요약해줘.\n조건: 서론 없이 ✅ 기호 사용, 음슴체로 간결하게 작성."},
                 {"inline_data": {"mime_type": "image/png", "data": encoded_image}}
             ]
         }]
     }
     
     try:
-        res = requests.post(url, json=payload, timeout=40)
+        res = requests.post(url, json=payload, timeout=60)
         if res.status_code == 200:
             return res.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+        else:
+            return f"❌ 요약 실패 (HTTP {res.status_code}: {res.text[:100]})"
     except Exception as e:
-        print(f"Gemini Vision Error: {e}")
-    return "❌ 멀티모달 요약 실패"
+        return f"❌ 요약 에러: {str(e)[:50]}"
 
 def get_pdf_first_page_image(pdf_url, session):
-    """PDF를 다운로드하여 첫 페이지를 이미지 데이터로 변환"""
+    """PDF 첫 페이지를 고화질 이미지로 변환"""
     try:
-        res = session.get(pdf_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=25)
+        res = session.get(pdf_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
         with fitz.open(stream=BytesIO(res.content), filetype="pdf") as doc:
-            page = doc[0]  # 첫 페이지만 분석 (핵심 내용이 보통 첫 장에 있음)
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 화질 2배 강화
+            page = doc[0]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) # 2배 확대 렌더링
             return pix.tobytes("png")
     except Exception as e:
-        print(f"PDF to Image Error: {e}")
+        print(f"PDF 변환 실패: {e}")
         return None
 
 async def main():
@@ -113,12 +115,9 @@ async def main():
                 
                 full_link = BASE_URL + a_tag['href'] if a_tag['href'].startswith('/') else a_tag['href']
                 
-                # 텍스트 추출 대신 이미지 변환 후 요약 시도
+                # 이미지 변환 및 요약
                 img_data = get_pdf_first_page_image(full_link, session)
-                if img_data:
-                    summary = get_summary_from_image(img_data)
-                else:
-                    summary = "❌ PDF 이미지를 불러올 수 없음"
+                summary = get_summary_from_image(img_data) if img_data else "❌ PDF 로딩 실패"
                 
                 msg = (f"{cat['i']} <b>{cat['n']} 리포트</b>\n\n"
                        f"출처: <b>{provider}</b>\n제목: {title}\n({today_str})\n"
@@ -132,7 +131,7 @@ async def main():
                 sent_list.append(report_idx)
                 await asyncio.sleep(2)
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"네트워크 에러: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
