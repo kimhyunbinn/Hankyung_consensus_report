@@ -2,12 +2,9 @@ name: 📈 한경 리포트 실시간 모니터링 (5분 간격)
 
 on:
   schedule:
-    # 한국 시간(KST) 기준 오전 08:00 ~ 오후 22:55 (5분 간격)
-    # UTC 23시는 한국 08시 / UTC 0-13시는 한국 09-22시
-    # */5 를 사용하여 5분마다 실행되도록 최적화
+    # 한국 시간 기준 오전 08:00 ~ 오후 22:55 (5분 간격)
     - cron: '*/5 23,0,1,2,3,4,5,6,7,8,9,10,11,12,13 * * *'
-  
-  workflow_dispatch: # 수동 실행 버튼 (테스트용)
+  workflow_dispatch:
 
 jobs:
   build:
@@ -19,30 +16,34 @@ jobs:
       - name: 1. 코드 체크아웃
         uses: actions/checkout@v3
 
-      - name: 2. 파이썬 환경 설정
+      - name: 2. 시스템 의존성 설치 (PDF 렌더링용)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmupdf-dev swig
+
+      - name: 3. 파이썬 환경 설정
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
 
-      - name: 3. 필수 패키지 설치
+      - name: 4. 필수 패키지 설치
         run: |
           pip install requests beautifulsoup4 python-telegram-bot PyMuPDF
 
-      - name: 4. 스크래퍼 실행 및 요약
+      - name: 5. 스크래퍼 실행 및 요약
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python scraper.py
 
-      - name: 5. 보낸 리포트 목록(sent_reports.txt) 업데이트 저장
+      - name: 6. 보낸 리포트 목록 업데이트 저장
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add sent_reports.txt || true
-          
           if git diff --staged --quiet; then
-            echo "새로운 리포트가 없어 업데이트하지 않습니다."
+            echo "변경사항 없음"
           else
             git commit -m "📝 보낸 리포트 목록 업데이트 [skip ci]"
             git push
