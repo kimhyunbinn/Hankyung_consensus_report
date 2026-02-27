@@ -24,35 +24,27 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 BASE_URL = "https://consensus.hankyung.com"
-DB_FILE = "sent_reports.txt"
 
-if not os.path.exists(DB_FILE):
-    with open(DB_FILE, "w") as f: f.write("")
-
-def get_sent_list():
-    with open(DB_FILE, "r") as f: return f.read().splitlines()
-
-def add_to_sent_list(report_id):
-    with open(DB_FILE, "a") as f: f.write(report_id + "\n")
-
-def get_summary_from_image(image_data):
-    """이미지(PDF 첫페이지)를 Gemini 2.0 Flash에게 전달하여 시각 분석 요약"""
+def get_summary_from_gemini(image_data=None, text_content=None):
+    """Gemini 2.0 Flash를 사용하여 이미지 또는 텍스트 요약"""
     if not GEMINI_API_KEY: return "❌ API 키 미설정"
     
-    # 모델명은 최신 안정 버전을 사용
-    model_name = "gemini-1.5-flash" # 2.0-flash가 간혹 할당량 이슈가 있을 수 있어 1.5-flash로 우선 시도
+    # 가장 범용적인 모델명 사용
+    model_name = "gemini-2.0-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
     
-    encoded_image = base64.b64encode(image_data).decode('utf-8')
+    prompt = "너는 금융 전문가야. 리포트 내용을 분석해서 투자자가 알아야 할 핵심 내용만 5가지로 요약해줘.\n조건: 서론 없이 ✅ 기호 사용, '~함' 형태의 음슴체로 간결하게 작성."
     
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": "너는 금융 전문가야. 첨부된 리포트 이미지를 읽고 투자자가 알아야 할 핵심 내용만 5가지로 요약해줘.\n조건: 서론 없이 ✅ 기호 사용, 음슴체로 간결하게 작성."},
-                {"inline_data": {"mime_type": "image/png", "data": encoded_image}}
-            ]
-        }]
-    }
+    if image_data:
+        encoded_image = base64.b64encode(image_data).decode('utf-8')
+        parts = [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "image/png", "data": encoded_image}}
+        ]
+    else:
+        parts = [{"text": f"{prompt}\n\n내용:\n{text_content[:8000]}"}]
+
+    payload = {"contents": [{"parts": parts}]}
     
     try:
         res = requests.post(url, json=payload, timeout=60)
@@ -61,23 +53,26 @@ def get_summary_from_image(image_data):
         else:
             return f"❌ 요약 실패 (HTTP {res.status_code}: {res.text[:100]})"
     except Exception as e:
-        return f"❌ 요약 에러: {str(e)[:50]}"
+        return f"❌ 요약 에러: {str(e)[:30]}"
 
-def get_pdf_first_page_image(pdf_url, session):
-    """PDF 첫 페이지를 고화질 이미지로 변환"""
+def process_pdf(pdf_url, session):
+    """PDF를 처리하여 이미지 또는 텍스트 추출"""
     try:
         res = session.get(pdf_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
         with fitz.open(stream=BytesIO(res.content), filetype="pdf") as doc:
+            # 1순위: 이미지 변환
             page = doc[0]
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) # 2배 확대 렌더링
-            return pix.tobytes("png")
-    except Exception as e:
-        print(f"PDF 변환 실패: {e}")
-        return None
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img_data = pix.tobytes("png")
+            
+            # 2순위: 텍스트 추출
+            text_data = "".join([p.get_text() for p in doc[:3]])
+            return img_data, text_data
+    except:
+        return None, None
 
 async def main():
     bot = telegram.Bot(token=TELEGRAM_TOKEN)
-    sent_list = get_sent_list()
     
     session = requests.Session()
     session.mount("https://", DESAdapter())
@@ -87,51 +82,38 @@ async def main():
         {"n": "산업", "i": "🏗️", "t": "industry"}
     ]
     
-    today_str = datetime.now().strftime("%Y.%m.%d")
-    
     for cat in targets:
         url = f"{BASE_URL}/analysis/list?skinType={cat['t']}"
         try:
             res = session.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
             soup = BeautifulSoup(res.text, 'html.parser')
-            rows = soup.select('tr')[1:6]
+            # 상단 3개만 테스트로 가져옴
+            rows = soup.select('tr')[1:4]
             
             for row in rows:
-                cols = row.find_all('td')
-                if len(cols) < 5: continue
-                
                 a_tag = row.find('a', href=re.compile(r'report_idx='))
                 if not a_tag: continue
                 
-                report_idx = re.search(r'report_idx=(\d+)', a_tag['href']).group(1)
-                if report_idx in sent_list: continue
-                
                 title = a_tag.get_text(strip=True)
-                provider = "출처미상"
-                for i in [4, 5, 3]:
-                    val = cols[i].get_text(strip=True)
-                    if val and not any(x.isdigit() for x in val):
-                        provider = val; break
-                
                 full_link = BASE_URL + a_tag['href'] if a_tag['href'].startswith('/') else a_tag['href']
                 
-                # 이미지 변환 및 요약
-                img_data = get_pdf_first_page_image(full_link, session)
-                summary = get_summary_from_image(img_data) if img_data else "❌ PDF 로딩 실패"
+                print(f"진행 중: {title}") # 로그 확인용
                 
-                msg = (f"{cat['i']} <b>{cat['n']} 리포트</b>\n\n"
-                       f"출처: <b>{provider}</b>\n제목: {title}\n({today_str})\n"
+                # PDF 처리 및 요약
+                img_data, text_data = process_pdf(full_link, session)
+                summary = get_summary_from_gemini(image_data=img_data, text_content=text_data)
+                
+                msg = (f"{cat['i']} <b>{cat['n']} 테스트</b>\n\n"
+                       f"제목: {title}\n"
                        f"--------------------------\n"
-                       f"📝 <b>핵심 요약 (AI 분석)</b>\n{summary}\n"
+                       f"📝 <b>핵심 요약</b>\n{summary}\n"
                        f"--------------------------\n"
                        f"<a href='{full_link}'>👉 원문 보기</a>")
                 
                 await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML', disable_web_page_preview=True)
-                add_to_sent_list(report_idx)
-                sent_list.append(report_idx)
-                await asyncio.sleep(2)
+                await asyncio.sleep(1) # 전송 속도 조절
         except Exception as e:
-            print(f"네트워크 에러: {e}")
+            print(f"Error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
